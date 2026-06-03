@@ -358,19 +358,61 @@ store_gateway:
   query_protection:
     rejection:
       threshold:
-        # EXPERIMENTAL: Max CPU utilization that this ingester can reach before
+        # EXPERIMENTAL: Max CPU utilization that this instance can reach before
         # rejecting new query request (across all tenants) in percentage,
         # between 0 and 1. monitored_resources config must include the resource
         # type. 0 to disable.
         # CLI flag: -store-gateway.query-protection.rejection.threshold.cpu-utilization
         [cpu_utilization: <float> | default = 0]
 
-        # EXPERIMENTAL: Max heap utilization that this ingester can reach before
+        # EXPERIMENTAL: Max heap utilization that this instance can reach before
         # rejecting new query request (across all tenants) in percentage,
         # between 0 and 1. monitored_resources config must include the resource
         # type. 0 to disable.
         # CLI flag: -store-gateway.query-protection.rejection.threshold.heap-utilization
         [heap_utilization: <float> | default = 0]
+
+    eviction:
+      threshold:
+        # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+        # evicting the heaviest running query (across all tenants) in
+        # percentage, between 0 and 1. monitored_resources config must include
+        # the resource type. 0 to disable.
+        # CLI flag: -store-gateway.query-protection.eviction.threshold.cpu-utilization
+        [cpu_utilization: <float> | default = 0]
+
+        # EXPERIMENTAL: Max heap utilization that this instance can reach before
+        # evicting the heaviest running query (across all tenants) in
+        # percentage, between 0 and 1. monitored_resources config must include
+        # the resource type. 0 to disable.
+        # CLI flag: -store-gateway.query-protection.eviction.threshold.heap-utilization
+        [heap_utilization: <float> | default = 0]
+
+      # EXPERIMENTAL: How frequently the evictor checks system resource
+      # utilization.
+      # CLI flag: -store-gateway.query-protection.eviction.check-interval
+      [check_interval: <duration> | default = 1s]
+
+      # EXPERIMENTAL: Number of check intervals to wait after an eviction before
+      # evicting again.
+      # CLI flag: -store-gateway.query-protection.eviction.cooldown-period
+      [cooldown_period: <int> | default = 3]
+
+      # EXPERIMENTAL: The query metric used to determine the heaviest query for
+      # eviction. Supported values: fetched_samples, fetched_series,
+      # fetched_chunks, fetched_chunk_bytes.
+      # CLI flag: -store-gateway.query-protection.eviction.eviction-metric
+      [eviction_metric: <string> | default = "fetched_samples"]
+
+      # EXPERIMENTAL: Minimum time a query must be running before it becomes
+      # eligible for eviction. Queries younger than this are ignored.
+      # CLI flag: -store-gateway.query-protection.eviction.min-query-age
+      [min_query_age: <duration> | default = 10s]
+
+      # EXPERIMENTAL: Maximum number of queries to evict in a single check cycle
+      # when resource thresholds are breached.
+      # CLI flag: -store-gateway.query-protection.eviction.max-evictions-per-cycle
+      [max_evictions_per_cycle: <int> | default = 1]
 
   hedged_request:
     # If true, hedged requests are applied to object store calls. It can help
@@ -1487,7 +1529,7 @@ blocks_storage:
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.block-index-attributes-ttl
       [block_index_attributes_ttl: <duration> | default = 168h]
 
-      # How long to cache content of the bucket index.
+      # How long to cache content of the bucket index. 0 disables caching
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-content-ttl
       [bucket_index_content_ttl: <duration> | default = 5m]
 
@@ -1950,8 +1992,8 @@ blocks_storage:
 
     # If TSDB has not received any data for this duration, and all blocks from
     # TSDB have been shipped, TSDB is closed and deleted from local disk. If set
-    # to positive value, this value should be equal or higher than
-    # -querier.query-ingesters-within flag to make sure that TSDB is not closed
+    # to positive value, this value must be greater than
+    # -limits.query-ingesters-within flag to make sure that TSDB is not closed
     # prematurely, which could cause partial query results. 0 or negative value
     # disables closing of idle TSDB.
     # CLI flag: -blocks-storage.tsdb.close-idle-tsdb-timeout
@@ -2027,6 +2069,25 @@ blocks_storage:
         # callers have given up.
         # CLI flag: -blocks-storage.expanded_postings_cache.block.fetch-timeout
         [fetch_timeout: <duration> | default = 0s]
+
+      # [EXPERIMENTAL] Maximum label cardinality for deferring regex matchers on
+      # the head block. When a regex matcher targets a label with more unique
+      # values than this threshold, it is applied lazily during iteration
+      # instead of postings lookup. 0 disables.
+      # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-max-cardinality
+      [lazy_matcher_max_cardinality: <int> | default = 0]
+
+      # [EXPERIMENTAL] Cardinality:postings ratio above which a simple regex
+      # (prefix-only, single contains) is deferred to lazy iteration. Lower =
+      # more aggressive deferral. Calibrated empirically; defaults to 6.
+      # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-simple-cost-ratio
+      [lazy_matcher_simple_cost_ratio: <int> | default = 6]
+
+      # [EXPERIMENTAL] Cardinality:postings ratio above which a complex regex
+      # (multi-substring, capture groups, character classes) is deferred. Lower
+      # = more aggressive deferral. Calibrated empirically; defaults to 2.
+      # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-complex-cost-ratio
+      [lazy_matcher_complex_cost_ratio: <int> | default = 2]
 
   users_scanner:
     # Strategy to use to scan users. Supported values are: list, user_index.

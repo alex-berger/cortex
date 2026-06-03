@@ -2113,7 +2113,7 @@ bucket_store:
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.block-index-attributes-ttl
     [block_index_attributes_ttl: <duration> | default = 168h]
 
-    # How long to cache content of the bucket index.
+    # How long to cache content of the bucket index. 0 disables caching
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-content-ttl
     [bucket_index_content_ttl: <duration> | default = 5m]
 
@@ -2572,8 +2572,8 @@ tsdb:
 
   # If TSDB has not received any data for this duration, and all blocks from
   # TSDB have been shipped, TSDB is closed and deleted from local disk. If set
-  # to positive value, this value should be equal or higher than
-  # -querier.query-ingesters-within flag to make sure that TSDB is not closed
+  # to positive value, this value must be greater than
+  # -limits.query-ingesters-within flag to make sure that TSDB is not closed
   # prematurely, which could cause partial query results. 0 or negative value
   # disables closing of idle TSDB.
   # CLI flag: -blocks-storage.tsdb.close-idle-tsdb-timeout
@@ -2649,6 +2649,25 @@ tsdb:
       # have given up.
       # CLI flag: -blocks-storage.expanded_postings_cache.block.fetch-timeout
       [fetch_timeout: <duration> | default = 0s]
+
+    # [EXPERIMENTAL] Maximum label cardinality for deferring regex matchers on
+    # the head block. When a regex matcher targets a label with more unique
+    # values than this threshold, it is applied lazily during iteration instead
+    # of postings lookup. 0 disables.
+    # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-max-cardinality
+    [lazy_matcher_max_cardinality: <int> | default = 0]
+
+    # [EXPERIMENTAL] Cardinality:postings ratio above which a simple regex
+    # (prefix-only, single contains) is deferred to lazy iteration. Lower = more
+    # aggressive deferral. Calibrated empirically; defaults to 6.
+    # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-simple-cost-ratio
+    [lazy_matcher_simple_cost_ratio: <int> | default = 6]
+
+    # [EXPERIMENTAL] Cardinality:postings ratio above which a complex regex
+    # (multi-substring, capture groups, character classes) is deferred. Lower =
+    # more aggressive deferral. Calibrated empirically; defaults to 2.
+    # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-complex-cost-ratio
+    [lazy_matcher_complex_cost_ratio: <int> | default = 2]
 
 users_scanner:
   # Strategy to use to scan users. Supported values are: list, user_index.
@@ -3101,12 +3120,6 @@ ha_tracker:
   # CLI flag: -distributor.ha-tracker.update-timeout-jitter-max
   [ha_tracker_update_timeout_jitter_max: <duration> | default = 5s]
 
-  # The timeout after which a new replica will be accepted if the currently
-  # elected replica stops sending data. This value must be greater than the
-  # update timeout plus the maximum jitter.
-  # CLI flag: -distributor.ha-tracker.failover-timeout
-  [ha_tracker_failover_timeout: <duration> | default = 30s]
-
   # [Experimental] If enabled, fetches all tracked keys on startup to populate
   # the local cache. This prevents duplicate GET calls for the same key while
   # the cache is cold, but could cause a spike in GET requests during
@@ -3212,6 +3225,17 @@ ha_tracker:
 # ingesters.
 # CLI flag: -distributor.sign-write-requests
 [sign_write_requests: <boolean> | default = false]
+
+# EXPERIMENTAL: Comma-separated list of HMAC-SHA256 keys authenticating
+# PushStream connections between distributors and ingesters. The first key is
+# used by the distributor to sign; all keys are accepted by the ingester. It
+# only takes effect when the -distributor.sign-write-requests is true. The key
+# change procedure for zero downtime is: (1) redeploy ingesters first with
+# 'newkey,oldkey' — ingester accepts both keys; (2) redeploy distributors with
+# 'newkey,oldkey' — distributor signs with newkey; (3) once stable, redeploy
+# both with 'newkey' to drop the old key.
+# CLI flag: -distributor.sign-write-requests-keys
+[sign_write_requests_keys: <string> | default = ""]
 
 # EXPERIMENTAL: If enabled, distributor would use stream connection to send
 # requests to ingesters.
@@ -3780,6 +3804,24 @@ lifecycler:
 # CLI flag: -ingester.active-queried-series-metrics-windows
 [active_queried_series_metrics_windows: <list of duration> | default = 2h0m0s]
 
+# Experimental: Enable tracking of series queried from head only and expose them
+# as metrics.
+# CLI flag: -ingester.head-queried-series-metrics-enabled
+[head_queried_series_metrics_enabled: <boolean> | default = false]
+
+# Duration of each sub-window for head queried series tracking.
+# CLI flag: -ingester.head-queried-series-metrics-window-duration
+[head_queried_series_metrics_window_duration: <duration> | default = 15m]
+
+# Sampling rate for head queried series tracking (1.0 = 100%%).
+# CLI flag: -ingester.head-queried-series-metrics-sample-rate
+[head_queried_series_metrics_sample_rate: <float> | default = 1]
+
+# Time windows to expose head queried series metrics. Also controls how long
+# per-metric-name cardinality is reported after last query.
+# CLI flag: -ingester.head-queried-series-metrics-windows
+[head_queried_series_metrics_windows: <list of duration> | default = 2h0m0s]
+
 # Enable uploading compacted blocks.
 # CLI flag: -ingester.upload-compacted-blocks-enabled
 [upload_compacted_blocks_enabled: <boolean> | default = true]
@@ -3859,19 +3901,61 @@ instance_limits:
 query_protection:
   rejection:
     threshold:
-      # EXPERIMENTAL: Max CPU utilization that this ingester can reach before
+      # EXPERIMENTAL: Max CPU utilization that this instance can reach before
       # rejecting new query request (across all tenants) in percentage, between
       # 0 and 1. monitored_resources config must include the resource type. 0 to
       # disable.
       # CLI flag: -ingester.query-protection.rejection.threshold.cpu-utilization
       [cpu_utilization: <float> | default = 0]
 
-      # EXPERIMENTAL: Max heap utilization that this ingester can reach before
+      # EXPERIMENTAL: Max heap utilization that this instance can reach before
       # rejecting new query request (across all tenants) in percentage, between
       # 0 and 1. monitored_resources config must include the resource type. 0 to
       # disable.
       # CLI flag: -ingester.query-protection.rejection.threshold.heap-utilization
       [heap_utilization: <float> | default = 0]
+
+  eviction:
+    threshold:
+      # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+      # evicting the heaviest running query (across all tenants) in percentage,
+      # between 0 and 1. monitored_resources config must include the resource
+      # type. 0 to disable.
+      # CLI flag: -ingester.query-protection.eviction.threshold.cpu-utilization
+      [cpu_utilization: <float> | default = 0]
+
+      # EXPERIMENTAL: Max heap utilization that this instance can reach before
+      # evicting the heaviest running query (across all tenants) in percentage,
+      # between 0 and 1. monitored_resources config must include the resource
+      # type. 0 to disable.
+      # CLI flag: -ingester.query-protection.eviction.threshold.heap-utilization
+      [heap_utilization: <float> | default = 0]
+
+    # EXPERIMENTAL: How frequently the evictor checks system resource
+    # utilization.
+    # CLI flag: -ingester.query-protection.eviction.check-interval
+    [check_interval: <duration> | default = 1s]
+
+    # EXPERIMENTAL: Number of check intervals to wait after an eviction before
+    # evicting again.
+    # CLI flag: -ingester.query-protection.eviction.cooldown-period
+    [cooldown_period: <int> | default = 3]
+
+    # EXPERIMENTAL: The query metric used to determine the heaviest query for
+    # eviction. Supported values: fetched_samples, fetched_series,
+    # fetched_chunks, fetched_chunk_bytes.
+    # CLI flag: -ingester.query-protection.eviction.eviction-metric
+    [eviction_metric: <string> | default = "fetched_samples"]
+
+    # EXPERIMENTAL: Minimum time a query must be running before it becomes
+    # eligible for eviction. Queries younger than this are ignored.
+    # CLI flag: -ingester.query-protection.eviction.min-query-age
+    [min_query_age: <duration> | default = 10s]
+
+    # EXPERIMENTAL: Maximum number of queries to evict in a single check cycle
+    # when resource thresholds are breached.
+    # CLI flag: -ingester.query-protection.eviction.max-evictions-per-cycle
+    [max_evictions_per_cycle: <int> | default = 1]
 ```
 
 ### `ingester_client_config`
@@ -4027,6 +4111,12 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # CLI flag: -distributor.ha-tracker.max-clusters
 [ha_max_clusters: <int> | default = 0]
 
+# If the elected replica doesn't send samples in this time, the HA tracker will
+# accept a new replica. This value must be greater than the update timeout plus
+# the maximum jitter.
+# CLI flag: -distributor.ha-tracker.failover-timeout
+[ha_tracker_failover_timeout: <duration> | default = 30s]
+
 # This flag can be used to specify label names that to drop during sample
 # ingestion within the distributor and can be repeated in order to drop multiple
 # labels.
@@ -4152,6 +4242,10 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # [Experimental] Enable limits per LabelSet. Supported limits per labelSet:
 # [max_series]
 [limits_per_label_set: <list of LimitsPerLabelSet> | default = []]
+
+# List of active series tracker configurations. Each tracker counts active
+# series matching its matchers and exposes the count as a metric.
+[active_series_trackers: <list of ActiveSeriesTrackerConfig> | default = []]
 
 # [EXPERIMENTAL] True to enable native histogram.
 # CLI flag: -blocks-storage.tsdb.enable-native-histograms
@@ -4394,8 +4488,9 @@ query_rejection:
 
 # Go text/template for alert generator URLs. Available variables: .ExternalURL
 # (resolved external URL) and .Expression (PromQL expression). Built-in
-# functions like urlquery are available. If empty, uses default Prometheus
-# /graph format.
+# functions like urlquery are available. A jsonEscape function is also provided
+# for embedding expressions inside JSON-encoded URL parameters. If empty, uses
+# default Prometheus /graph format.
 [ruler_alert_generator_url_template: <string> | default = ""]
 
 # Enable to allow rules to be evaluated with data from a single zone, if other
@@ -4676,6 +4771,18 @@ The `memberlist_config` configures the Gossip memberlist.
 # Timeout for writing 'packet' data.
 # CLI flag: -memberlist.packet-write-timeout
 [packet_write_timeout: <duration> | default = 5s]
+
+# Timeout for reading packet data from inbound connections. 0 = no limit.
+# CLI flag: -memberlist.packet-read-timeout
+[packet_read_timeout: <duration> | default = 5s]
+
+# Maximum size in bytes of an inbound gossip packet. 0 = no limit.
+# CLI flag: -memberlist.max-packet-size
+[max_packet_size: <int> | default = 1048576]
+
+# Maximum number of concurrent inbound TCP connections. 0 = no limit.
+# CLI flag: -memberlist.max-concurrent-connections
+[max_concurrent_connections: <int> | default = 100]
 
 # Enable TLS on the memberlist transport layer.
 # CLI flag: -memberlist.tls-enabled
@@ -4999,6 +5106,65 @@ thanos_engine:
 # Eval time threshold above which a timeout is classified as user error (4XX).
 # CLI flag: -querier.timeout-classification-eval-threshold
 [timeout_classification_eval_threshold: <duration> | default = 1m30s]
+
+query_protection:
+  rejection:
+    threshold:
+      # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+      # rejecting new query request (across all tenants) in percentage, between
+      # 0 and 1. monitored_resources config must include the resource type. 0 to
+      # disable.
+      # CLI flag: -querier.query-protection.rejection.threshold.cpu-utilization
+      [cpu_utilization: <float> | default = 0]
+
+      # EXPERIMENTAL: Max heap utilization that this instance can reach before
+      # rejecting new query request (across all tenants) in percentage, between
+      # 0 and 1. monitored_resources config must include the resource type. 0 to
+      # disable.
+      # CLI flag: -querier.query-protection.rejection.threshold.heap-utilization
+      [heap_utilization: <float> | default = 0]
+
+  eviction:
+    threshold:
+      # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+      # evicting the heaviest running query (across all tenants) in percentage,
+      # between 0 and 1. monitored_resources config must include the resource
+      # type. 0 to disable.
+      # CLI flag: -querier.query-protection.eviction.threshold.cpu-utilization
+      [cpu_utilization: <float> | default = 0]
+
+      # EXPERIMENTAL: Max heap utilization that this instance can reach before
+      # evicting the heaviest running query (across all tenants) in percentage,
+      # between 0 and 1. monitored_resources config must include the resource
+      # type. 0 to disable.
+      # CLI flag: -querier.query-protection.eviction.threshold.heap-utilization
+      [heap_utilization: <float> | default = 0]
+
+    # EXPERIMENTAL: How frequently the evictor checks system resource
+    # utilization.
+    # CLI flag: -querier.query-protection.eviction.check-interval
+    [check_interval: <duration> | default = 1s]
+
+    # EXPERIMENTAL: Number of check intervals to wait after an eviction before
+    # evicting again.
+    # CLI flag: -querier.query-protection.eviction.cooldown-period
+    [cooldown_period: <int> | default = 3]
+
+    # EXPERIMENTAL: The query metric used to determine the heaviest query for
+    # eviction. Supported values: fetched_samples, fetched_series,
+    # fetched_chunks, fetched_chunk_bytes.
+    # CLI flag: -querier.query-protection.eviction.eviction-metric
+    [eviction_metric: <string> | default = "fetched_samples"]
+
+    # EXPERIMENTAL: Minimum time a query must be running before it becomes
+    # eligible for eviction. Queries younger than this are ignored.
+    # CLI flag: -querier.query-protection.eviction.min-query-age
+    [min_query_age: <duration> | default = 10s]
+
+    # EXPERIMENTAL: Maximum number of queries to evict in a single check cycle
+    # when resource thresholds are breached.
+    # CLI flag: -querier.query-protection.eviction.max-evictions-per-cycle
+    [max_evictions_per_cycle: <int> | default = 1]
 ```
 
 ### `query_frontend_config`
@@ -6754,19 +6920,61 @@ sharding_ring:
 query_protection:
   rejection:
     threshold:
-      # EXPERIMENTAL: Max CPU utilization that this ingester can reach before
+      # EXPERIMENTAL: Max CPU utilization that this instance can reach before
       # rejecting new query request (across all tenants) in percentage, between
       # 0 and 1. monitored_resources config must include the resource type. 0 to
       # disable.
       # CLI flag: -store-gateway.query-protection.rejection.threshold.cpu-utilization
       [cpu_utilization: <float> | default = 0]
 
-      # EXPERIMENTAL: Max heap utilization that this ingester can reach before
+      # EXPERIMENTAL: Max heap utilization that this instance can reach before
       # rejecting new query request (across all tenants) in percentage, between
       # 0 and 1. monitored_resources config must include the resource type. 0 to
       # disable.
       # CLI flag: -store-gateway.query-protection.rejection.threshold.heap-utilization
       [heap_utilization: <float> | default = 0]
+
+  eviction:
+    threshold:
+      # EXPERIMENTAL: Max CPU utilization that this instance can reach before
+      # evicting the heaviest running query (across all tenants) in percentage,
+      # between 0 and 1. monitored_resources config must include the resource
+      # type. 0 to disable.
+      # CLI flag: -store-gateway.query-protection.eviction.threshold.cpu-utilization
+      [cpu_utilization: <float> | default = 0]
+
+      # EXPERIMENTAL: Max heap utilization that this instance can reach before
+      # evicting the heaviest running query (across all tenants) in percentage,
+      # between 0 and 1. monitored_resources config must include the resource
+      # type. 0 to disable.
+      # CLI flag: -store-gateway.query-protection.eviction.threshold.heap-utilization
+      [heap_utilization: <float> | default = 0]
+
+    # EXPERIMENTAL: How frequently the evictor checks system resource
+    # utilization.
+    # CLI flag: -store-gateway.query-protection.eviction.check-interval
+    [check_interval: <duration> | default = 1s]
+
+    # EXPERIMENTAL: Number of check intervals to wait after an eviction before
+    # evicting again.
+    # CLI flag: -store-gateway.query-protection.eviction.cooldown-period
+    [cooldown_period: <int> | default = 3]
+
+    # EXPERIMENTAL: The query metric used to determine the heaviest query for
+    # eviction. Supported values: fetched_samples, fetched_series,
+    # fetched_chunks, fetched_chunk_bytes.
+    # CLI flag: -store-gateway.query-protection.eviction.eviction-metric
+    [eviction_metric: <string> | default = "fetched_samples"]
+
+    # EXPERIMENTAL: Minimum time a query must be running before it becomes
+    # eligible for eviction. Queries younger than this are ignored.
+    # CLI flag: -store-gateway.query-protection.eviction.min-query-age
+    [min_query_age: <duration> | default = 10s]
+
+    # EXPERIMENTAL: Maximum number of queries to evict in a single check cycle
+    # when resource thresholds are breached.
+    # CLI flag: -store-gateway.query-protection.eviction.max-evictions-per-cycle
+    [max_evictions_per_cycle: <int> | default = 1]
 
 hedged_request:
   # If true, hedged requests are applied to object store calls. It can help with
@@ -6862,6 +7070,17 @@ limits:
 # becomes the default partition which matches any series that doesn't match any
 # other explicitly defined label sets.'
 [label_set: <map of string (labelName) to string (labelValue)> | default = []]
+```
+
+### `ActiveSeriesTrackerConfig`
+
+```yaml
+# Name of the tracker, used as a label value in the emitted metric.
+[name: <string> | default = ""]
+
+# PromQL series selector (e.g. {__name__=~"api_.*"}). All matchers must match
+# for a series to be counted.
+[matchers: <string> | default = ""]
 ```
 
 ### `PriorityDef`

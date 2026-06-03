@@ -5,7 +5,6 @@ package integration
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -89,7 +88,7 @@ func TestParquetFuzz(t *testing.T) {
 	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
 
 	ctx := context.Background()
-	rnd := rand.New(rand.NewSource(time.Now().Unix()))
+	rnd := newFuzzRand(t)
 	dir := filepath.Join(s.SharedDir(), "data")
 	numSeries := 10
 	numSamples := 60
@@ -109,18 +108,20 @@ func TestParquetFuzz(t *testing.T) {
 	minio := e2edb.NewMinio(9000, flags["-blocks-storage.s3.bucket-name"])
 	require.NoError(t, s.StartAndWaitReady(minio))
 
-	cortex := e2ecortex.NewSingleBinary("cortex", flags, "")
-	require.NoError(t, s.StartAndWaitReady(cortex))
-
 	storage, err := e2ecortex.NewS3ClientForMinio(minio, flags["-blocks-storage.s3.bucket-name"])
 	require.NoError(t, err)
 	bkt := bucket.NewUserBucketClient("user-1", storage.GetBucket(), nil)
 
+	// Upload the block before starting cortex so the first compactor scan finds
+	// the complete block and includes it in the bucket index immediately.
 	err = block.Upload(ctx, log.Logger, bkt, filepath.Join(dir, id.String()), metadata.NoneFunc)
 	require.NoError(t, err)
 
+	cortex := e2ecortex.NewSingleBinary("cortex", flags, "")
+	require.NoError(t, s.StartAndWaitReady(cortex))
+
 	// Wait until we convert the blocks
-	cortex_testutil.Poll(t, 30*time.Second, true, func() interface{} {
+	cortex_testutil.Poll(t, 60*time.Second, true, func() interface{} {
 		found := false
 		foundBucketIndex := false
 
@@ -170,10 +171,11 @@ func TestParquetFuzz(t *testing.T) {
 	opts := []promqlsmith.Option{
 		// @ modifier and offset disabled: known bug in Prometheus (e.g. predict_linear with @/offset can panic).
 		promqlsmith.WithEnabledFunctions(enabledFunctions),
+		promqlsmith.WithEnabledAggrs(enabledAggrs),
 	}
 	ps := promqlsmith.New(rnd, lbls, opts...)
 
-	runQueryFuzzTestCases(t, ps, c1, c2, end, start, end, scrapeInterval, 1000, false)
+	runQueryFuzzTestCases(t, ps, c1, c2, end, start, end, scrapeInterval, 1000, true)
 
 	require.NoError(t, cortex.WaitSumMetricsWithOptions(e2e.Greater(0), []string{"cortex_parquet_queryable_blocks_queried_total"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "type", "parquet"))))
@@ -238,7 +240,7 @@ func TestParquetProjectionPushdownFuzz(t *testing.T) {
 	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs", []byte{}))
 
 	ctx := context.Background()
-	rnd := rand.New(rand.NewSource(time.Now().Unix()))
+	rnd := newFuzzRand(t)
 	dir := filepath.Join(s.SharedDir(), "data")
 	numSeries := 20
 	numSamples := 100

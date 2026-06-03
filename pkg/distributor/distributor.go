@@ -37,6 +37,7 @@ import (
 	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/extract"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/labelset"
 	"github.com/cortexproject/cortex/pkg/util/limiter"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
@@ -123,6 +124,7 @@ type Distributor struct {
 	incomingMetadata                 *prometheus.CounterVec
 	nonHASamples                     *prometheus.CounterVec
 	dedupedSamples                   *prometheus.CounterVec
+	receivedHistogramBuckets         *prometheus.HistogramVec
 	labelsHistogram                  prometheus.Histogram
 	ingesterAppends                  *prometheus.CounterVec
 	ingesterAppendFailures           *prometheus.CounterVec
@@ -153,13 +155,14 @@ type Config struct {
 	RemoteTimeout      time.Duration `yaml:"remote_timeout"`
 	ExtraQueryDelay    time.Duration `yaml:"extra_queue_delay"`
 
-	ShardingStrategy                    string `yaml:"sharding_strategy"`
-	ShardByAllLabels                    bool   `yaml:"shard_by_all_labels"`
-	ExtendWrites                        bool   `yaml:"extend_writes"`
-	SignWriteRequestsEnabled            bool   `yaml:"sign_write_requests"`
-	UseStreamPush                       bool   `yaml:"use_stream_push"`
-	RemoteWriteV2Enabled                bool   `yaml:"remote_writev2_enabled"`
-	AcceptUnknownRemoteWriteContentType bool   `yaml:"accept_unknown_remote_write_content_type"`
+	ShardingStrategy                    string                       `yaml:"sharding_strategy"`
+	ShardByAllLabels                    bool                         `yaml:"shard_by_all_labels"`
+	ExtendWrites                        bool                         `yaml:"extend_writes"`
+	SignWriteRequestsEnabled            bool                         `yaml:"sign_write_requests"`
+	SignWriteRequestsKeys               flagext.SecretStringSliceCSV `yaml:"sign_write_requests_keys"`
+	UseStreamPush                       bool                         `yaml:"use_stream_push"`
+	RemoteWriteV2Enabled                bool                         `yaml:"remote_writev2_enabled"`
+	AcceptUnknownRemoteWriteContentType bool                         `yaml:"accept_unknown_remote_write_content_type"`
 
 	// Distributors ring
 	DistributorRing RingConfig `yaml:"ring"`
@@ -217,6 +220,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.ExtraQueryDelay, "distributor.extra-query-delay", 0, "Time to wait before sending more than the minimum successful query requests.")
 	f.BoolVar(&cfg.ShardByAllLabels, "distributor.shard-by-all-labels", false, "Distribute samples based on all labels, as opposed to solely by user and metric name.")
 	f.BoolVar(&cfg.SignWriteRequestsEnabled, "distributor.sign-write-requests", false, "EXPERIMENTAL: If enabled, sign the write request between distributors and ingesters.")
+	f.Var(&cfg.SignWriteRequestsKeys, "distributor.sign-write-requests-keys", "EXPERIMENTAL: Comma-separated list of HMAC-SHA256 keys authenticating PushStream connections between distributors and ingesters. The first key is used by the distributor to sign; all keys are accepted by the ingester. It only takes effect when the -distributor.sign-write-requests is true. The key change procedure for zero downtime is: (1) redeploy ingesters first with 'newkey,oldkey' — ingester accepts both keys; (2) redeploy distributors with 'newkey,oldkey' — distributor signs with newkey; (3) once stable, redeploy both with 'newkey' to drop the old key.")
 	f.BoolVar(&cfg.UseStreamPush, "distributor.use-stream-push", false, "EXPERIMENTAL: If enabled, distributor would use stream connection to send requests to ingesters.")
 	f.StringVar(&cfg.ShardingStrategy, "distributor.sharding-strategy", util.ShardingStrategyDefault, fmt.Sprintf("The sharding strategy to use. Supported values are: %s.", strings.Join(supportedShardingStrategies, ", ")))
 	f.BoolVar(&cfg.ExtendWrites, "distributor.extend-writes", true, "Try writing to an additional ingester in the presence of an ingester not in the ACTIVE state. It is useful to disable this along with -ingester.unregister-on-shutdown=false in order to not spread samples to extra ingesters during rolling restarts with consistent naming.")
@@ -246,7 +250,11 @@ func (cfg *Config) Validate(limits validation.Limits) error {
 		return errInvalidTenantShardSize
 	}
 
-	return cfg.HATrackerConfig.Validate()
+	if err := cfg.HATrackerConfig.Validate(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 const (
@@ -345,6 +353,15 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Namespace: "cortex",
 			Name:      "distributor_received_metadata_total",
 			Help:      "The total number of received metadata, excluding rejected.",
+		}, []string{"user"}),
+		receivedHistogramBuckets: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
+			Namespace:                       "cortex",
+			Name:                            "distributor_received_histogram_buckets",
+			Help:                            "The number of buckets in received native histogram samples before validation, per user.",
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: 1 * time.Hour,
+			Buckets:                         prometheus.ExponentialBuckets(1, 2, 10), // 1 to 512 buckets
 		}, []string{"user"}),
 		incomingSamples: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Namespace: "cortex",
@@ -523,6 +540,7 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 	d.receivedSamples.DeleteLabelValues(userID, sampleMetricTypeHistogramNHCB)
 	d.receivedExemplars.DeleteLabelValues(userID)
 	d.receivedMetadata.DeleteLabelValues(userID)
+	d.receivedHistogramBuckets.DeleteLabelValues(userID)
 	d.incomingSamples.DeleteLabelValues(userID, sampleMetricTypeFloat)
 	d.incomingSamples.DeleteLabelValues(userID, sampleMetricTypeHistogram)
 	d.incomingSamples.DeleteLabelValues(userID, sampleMetricTypeHistogramNHCB)
@@ -680,19 +698,21 @@ func (d *Distributor) validateSeries(ts cortexpb.PreallocTimeseries, userID stri
 		}
 	}
 
-	var histograms []cortexpb.Histogram
+	var histograms []cortexpb.WrappedHistogram
 	if len(ts.Histograms) > 0 {
 		// Only alloc when data present
-		histograms = make([]cortexpb.Histogram, 0, len(ts.Histograms))
+		histograms = make([]cortexpb.WrappedHistogram, 0, len(ts.Histograms))
+		receivedBucketsObserver := d.receivedHistogramBuckets.WithLabelValues(userID)
 		for i, h := range ts.Histograms {
 			if err := validation.ValidateSampleTimestamp(d.validateMetrics, limits, userID, ts.Labels, h.TimestampMs); err != nil {
 				return emptyPreallocSeries, err
 			}
-			convertedHistogram, err := validation.ValidateNativeHistogram(d.validateMetrics, limits, userID, ts.Labels, h)
+			receivedBucketsObserver.Observe(float64(h.BucketCount()))
+			convertedHistogram, err := validation.ValidateNativeHistogram(d.validateMetrics, limits, userID, ts.Labels, h.Histogram)
 			if err != nil {
 				return emptyPreallocSeries, err
 			}
-			ts.Histograms[i] = convertedHistogram
+			ts.Histograms[i].Histogram = convertedHistogram
 		}
 		histograms = append(histograms, ts.Histograms...)
 	}
@@ -1019,7 +1039,7 @@ type samplesLabelSetEntry struct {
 }
 
 // countNHCB returns the number of native histograms with custom buckets schema in the given slice.
-func countNHCB(histograms []cortexpb.Histogram) int {
+func countNHCB(histograms []cortexpb.WrappedHistogram) int {
 	n := 0
 	for _, h := range histograms {
 		if histogram.IsCustomBucketsSchema(h.GetSchema()) {
